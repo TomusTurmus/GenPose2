@@ -1,0 +1,14 @@
+name: genpose2
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10.14
+  - pip
+  - pip:
+    - torch==2.1.0
+    - torchvision==0.16.0
+    - torchaudio==2.1.0
+    - ninja
+    - cutoop
+    - -r file:requirements.txt

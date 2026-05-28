@@ -1,0 +1,21 @@
+services:
+  genpose2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: genpose2:latest
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_HOME=/usr/local/cuda-11.8
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - ..:/workspace/GenPose2
+      - ../results:/workspace/GenPose2/results
+      - ../data:/workspace/GenPose2/data
+      - ../checkpoints:/workspace/GenPose2/checkpoints
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    tty: true
+    stdin_open: true
+    command: /bin/bash

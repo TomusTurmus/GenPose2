@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 import numpy as np
 from tqdm import tqdm
 import pickle
@@ -274,7 +275,11 @@ def visualize_pose(data:InferDataset, all_final_pose, all_final_length, visualiz
 
 def main():
     ######################################## PARAMETERS ########################################
-    DATA_PATH = 'data/Omni6DPose/ROPE/000007'                 # Path to the data
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_path', type=str, default='data/Omni6DPose/ROPE/000007', help='Path to the input video directory')
+    args = parser.parse_args()
+
+    DATA_PATH = args.data_path                                  # Path to the data
     TRACKING = True                                           # Tracking mode
 
     # Tracking parameter, if the relative pose between the current frame and the previous frame
@@ -291,6 +296,10 @@ def main():
     ''' load data '''
     # Get data from image file
     color_images = sorted(glob.glob(DATA_PATH + '/*_color.png'))
+    if not color_images:
+        raise FileNotFoundError(
+            f'No input frames found under {DATA_PATH}. Set --data_path to a directory containing *_color.png files.'
+        )
     GenPose2 = create_genpose2(
         score_model_path=SCORE_MODEL_PATH, 
         energy_model_path=ENERGY_MODEL_PATH,
@@ -298,6 +307,7 @@ def main():
     )
     
     cv2.namedWindow('rgb')
+
     for index, color_image in enumerate(tqdm(color_images)):
         data_prefix = color_image.replace('color.png', '')
         data = InferDataset.alternetive_init(data_prefix, img_size=GenPose2.cfg.img_size, device=GenPose2.cfg.device, n_pts=GenPose2.cfg.num_points)
