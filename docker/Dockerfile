@@ -28,7 +28,8 @@ RUN $CONDA_DIR/bin/conda create -n genpose2 python=3.10.14 -y && \
 
 # Ensure conda env binaries are on PATH
 ENV PATH=$CONDA_DIR/envs/genpose2/bin:$PATH
-ENV TORCH_CUDA_ARCH_LIST=8.9
+# Build CUDA kernels for the local GPU (RTX A2000 = sm_86); keep 8.9 (RTX 4090) too.
+ENV TORCH_CUDA_ARCH_LIST="8.6;8.9"
 
 # Upgrade pip and install build helpers inside the conda environment
 RUN conda run -n genpose2 python -m pip install --no-cache-dir --upgrade pip "setuptools<70" wheel ninja
@@ -74,7 +75,10 @@ ENV CUDA_HOME=/usr/local/cuda-11.8
 # image focused on the shared CUDA/PyTorch/PyTorch3D runtime.
 RUN mkdir -p /workspace/GenPose2
 
-VOLUME ["/workspace/GenPose2/results", "/workspace/GenPose2/data", "/workspace/GenPose2/checkpoints"]
+# NOTE: do NOT declare VOLUME for results/data/checkpoints. When the repo is
+# bind-mounted at /workspace/GenPose2 without also bind-mounting these subdirs,
+# a VOLUME directive overlays an empty anonymous volume on top, shadowing the
+# real checkpoints (e.g. results/ckpts/ScoreNet/scorenet.pth -> "not exists").
 
 COPY /docker/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh

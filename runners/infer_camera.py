@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")  # must precede `import cv2` to read .exr depth/mask
 import sys
 import numpy as np
 from tqdm import tqdm
@@ -8,8 +9,6 @@ import random
 import gc
 import cv2
 import open3d as o3d
-import pyrealsense2 as rs
-import pyrealsense2 as rs
 import numpy as np
 import glob
 
@@ -25,7 +24,8 @@ from utils.so3_visualize import visualize_so3
 from cutoop.eval_utils import DetectMatch, Metrics
 from configs.config import get_config
 from datasets.datasets_infer_camera import InferDataset
-from camera.camera import RealSenseRobotStream
+# camera.camera imports pyrealsense2 + sam2 at module load; only needed for the
+# live-camera path, so import it lazily inside main() (see USE_CAM branch).
 import imageio.v2 as imageio
 
 from flask import Flask, request
@@ -279,17 +279,22 @@ def visualize_pose(data:InferDataset, all_final_pose, all_final_length, visualiz
 
 def main():
     ######################################## PARAMETERS ########################################
-    USE_CAM = True                                              # Use camera or not
-    SAVE_CAM = True                                             # Save camera images or not(only use it when USE_CAM is True)
-    SAVE_RES = True                                             # Save the infered images or not
-    DATA_POINT = 1                                              # The data point index
-    CAM_SERIAL_NUM = "251622062545"                             # Camera number, default is D415 of our camera, you can't use it directly.
+    # Defaults match the live-camera demo; override via env vars for offline/batch runs, e.g.
+    #   USE_CAM=0 SAVE_CAM=0 HEADLESS=1 DATA_POINT=1 python runners/infer_camera.py
+    def _envflag(name, default):
+        return os.environ.get(name, str(int(default))).lower() in ("1", "true", "yes")
+    USE_CAM = _envflag("USE_CAM", True)                        # Use camera or not
+    SAVE_CAM = _envflag("SAVE_CAM", True) and USE_CAM          # Save camera images (only when USE_CAM)
+    SAVE_RES = _envflag("SAVE_RES", True)                      # Save the infered images or not
+    HEADLESS = _envflag("HEADLESS", False)                     # Skip cv2 GUI windows (no X11 needed)
+    DATA_POINT = int(os.environ.get("DATA_POINT", "1"))        # The data point index
+    CAM_SERIAL_NUM = os.environ.get("CAM_SERIAL_NUM", "251622062545")  # D415 serial; set your own.
 
     # Tracking parameter, if the relative pose between the current frame and the previous frame
     # is large, such as low video FPS or fast object motion, you can set a larger value. The default
     # TRACKING_T0 is set to 0.15.
-    TRACKING = True                                             # Tracking mode
-    TRACKING_T0 = 0.3
+    TRACKING = _envflag("TRACKING", True)                      # Tracking mode
+    TRACKING_T0 = float(os.environ.get("TRACKING_T0", "0.3"))
     ######################################## PARAMETERS ########################################
 
 
@@ -321,6 +326,7 @@ def main():
     PREV_POSE = None
 
     if USE_CAM:
+        from camera.camera import RealSenseRobotStream  # pulls in pyrealsense2 + sam2
         print("Using camera flow ")
         print("press 's' to select some point on the some new target object")
         print("press 'n' to select points on the next object")
@@ -428,16 +434,14 @@ def main():
                 PREV_POSE = None
                 obj_idxl = obj_idxx
             color_image_w_pose = cv2.cvtColor(color_image_w_pose, cv2.COLOR_RGB2BGR)
-            cv2.imshow('rgb', color_image_w_pose)
+            if not HEADLESS:
+                cv2.imshow('rgb', color_image_w_pose)
             if SAVE_RES:
                 cv2.imwrite(os.path.join(save_res_img_path, f"infer_{index:04d}.png"), color_image_w_pose)
-            key = cv2.waitKey(1) & 0xFF
+            key = (cv2.waitKey(1) & 0xFF) if not HEADLESS else 255
             if key == ord('c'):               # press 'c' to stop tracking
                 break
-            elif key == ord('s'):             # press 's' to select a new target object
-                rs_streamer.reset_mask_selection()
-            if SAVE_RES:
-                cv2.imwrite(os.path.join(save_res_img_path, f"infer_{index:04d}.png"), color_image_w_pose)
+            # 's' (reselect mask) is camera-only; no streamer exists offline.
 
     # img names "infer_{index:04d}.png" and only use 0~{cur_cnt}
     img_paths = sorted(glob.glob(os.path.join(save_res_img_path, '*.png')))
