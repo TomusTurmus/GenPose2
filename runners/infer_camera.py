@@ -118,16 +118,20 @@ class GenPose2:
 
     def _aggregate_pose(self, all_pred_pose, all_pred_energy):
         if all_pred_energy is None:
-            all_pred_energy = [torch.ones(*(all_pred_pose[i].shape[:2]), 2) 
+            all_pred_energy = [torch.ones(*(all_pred_pose[i].shape[:2]), 2)
                             for i in range(len(all_pred_pose))]
 
         all_aggregated_pose = []
-        
+        all_scores = []
+
         for i, (pred_pose, pred_energy) in enumerate(zip(all_pred_pose, all_pred_energy)):
             sorted_pose, sorted_energy = sort_poses_by_energy(pred_pose, pred_energy)
             bs = pred_pose.shape[0]
             retain_num = int(self.cfg.eval_repeat_num * self.cfg.retain_ratio)
             good_pose = sorted_pose[:, :retain_num, :]
+            # Mean energy of the retained samples = per-object confidence. 1.0 when no
+            # energy model is loaded (the ones-placeholder above).
+            all_scores.append(sorted_energy[:, :retain_num, :].mean(dim=(1, 2)).cpu())
             rot_matrix = get_rot_matrix(good_pose[:, :, :-3].reshape(bs * retain_num, -1), self.cfg.pose_mode)
             quat_wxyz = matrix_to_quaternion(rot_matrix).reshape(bs, retain_num, -1)
             aggregated_quat_wxyz = average_quaternion_batch(quat_wxyz)
@@ -150,8 +154,8 @@ class GenPose2:
             all_aggregated_pose.append(aggregated_pose)
             if i % 10 == 9:
                 gc.collect()
-        
-        return all_aggregated_pose
+
+        return all_aggregated_pose, all_scores
 
     def _inference_scale(self, data:InferDataset, scale_agent:PoseNet, all_score_feature, all_aggregated_pose):
         if self.cfg.pretrained_scale_model_path is None:
@@ -213,7 +217,15 @@ class GenPose2:
                 # all_dm.draw_image(index=index)
                 set_trace()
 
-    def inference(self, data:InferDataset, prev_pose=None, tracking=False, tracking_T0=0.15):
+    def inference(self, data:InferDataset, prev_pose=None, tracking=False, tracking_T0=0.15,
+                  return_scores=False):
+        """Estimate pose + size for every object in `data`.
+
+        prev_pose warm-starts the sampler (init_x), so passing it makes a frame depend on
+        the previous one *even when tracking=False* -- tracking only additionally lowers T0.
+        Pass prev_pose=None for genuinely independent per-frame estimation (see PER_FRAME).
+        return_scores also returns the per-object retained-sample energy (confidence).
+        """
         prev_pose_genpose2 = None
         if prev_pose is not None:
             # print("yes")
@@ -228,17 +240,56 @@ class GenPose2:
         all_pred_pose, all_score_feature = self._inference_score(data, self.score_agent, prev_pose_genpose2, infer_T0)
         if self.cfg.pretrained_energy_model_path is not None:
             all_pred_energy = self._inference_energy(data, self.energy_agent, all_pred_pose)
-            all_aggregated_pose = self._aggregate_pose(all_pred_pose, all_pred_energy)
+            all_aggregated_pose, all_scores = self._aggregate_pose(all_pred_pose, all_pred_energy)
         else:
-            all_aggregated_pose = self._aggregate_pose(all_pred_pose, None)
+            all_aggregated_pose, all_scores = self._aggregate_pose(all_pred_pose, None)
 
         all_final_pose, all_final_length = self._inference_scale(data, self.scale_agent, all_score_feature, all_aggregated_pose)
 
+        if return_scores:
+            return all_final_pose, all_final_length, all_scores
         return all_final_pose, all_final_length
 
 
 def create_genpose2(score_model_path:str, energy_model_path:str, scale_model_path:str):
     return GenPose2(score_model_path, energy_model_path, scale_model_path)
+
+
+def pose_rows(index, frame_stem, obj_ids, pose, length, scores):
+    """Flatten one frame's estimates into CSV rows (one per detected object).
+
+    Rows are keyed by im_id (the runner's 0-based frame order) AND frame_stem (the
+    source file prefix), so results survive re-indexing. Units are METRES throughout
+    -- GenPose++ works in metres (depth is metres), unlike BOP/GigaPose millimetres.
+    """
+    def fmt(a):
+        return ' '.join(f'{v:.9g}' for v in np.asarray(a).reshape(-1))
+
+    rows = []
+    affine = pose[0].cpu().numpy()       # [n_obj, 4, 4]
+    size = length[0].cpu().numpy()       # [n_obj, 3]
+    score = scores[0].cpu().numpy()      # [n_obj]
+    for j, obj_id in enumerate(obj_ids):
+        rows.append({
+            'im_id': index,
+            'frame': frame_stem,
+            'obj_id': int(obj_id),
+            'R': fmt(affine[j][:3, :3]),
+            't': fmt(affine[j][:3, 3]),
+            'size': fmt(size[j]),
+            'score': f'{float(score[j]):.6g}',
+        })
+    return rows
+
+
+def write_pose_csv(path, rows):
+    import csv
+    fields = ['im_id', 'frame', 'obj_id', 'R', 't', 'size', 'score']
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"poses: {len(rows)} rows -> {path}")
 
 def visualize_pose(data:InferDataset, all_final_pose, all_final_length, visualize_pts=False, visualize_image=False):
     # color_img = cv2.cvtColor(data.color, cv2.COLOR_RGB2BGR)
@@ -295,6 +346,14 @@ def main():
     # TRACKING_T0 is set to 0.15.
     TRACKING = _envflag("TRACKING", True)                      # Tracking mode
     TRACKING_T0 = float(os.environ.get("TRACKING_T0", "0.3"))
+
+    # PER_FRAME estimates every frame from scratch (prev pose never fed back as init_x).
+    # Needed to measure the model's *intrinsic* jitter: with the warm start on, consecutive
+    # frames are correlated by construction and frame-to-frame deltas understate it.
+    # TRACKING=0 alone does NOT achieve this -- it only restores the full T0, still seeding
+    # the sampler from the previous pose. Offline (USE_CAM=0) only.
+    PER_FRAME = _envflag("PER_FRAME", False)
+    SAVE_POSES = _envflag("SAVE_POSES", True)                  # Write poses.csv (offline path)
     ######################################## PARAMETERS ########################################
 
 
@@ -405,20 +464,29 @@ def main():
     else:
         color_images = sorted(glob.glob(data_path + '/*_color.png'))
         os.makedirs(save_res_img_path, exist_ok=True)
-        
+        if not color_images:
+            raise SystemExit(f"No *_color.png in {data_path}. Prepare a clip first: "
+                             f"scripts/prepare_video_genpose2.py --data_point {DATA_POINT}")
+        print(f"offline: {len(color_images)} frames from {data_path} "
+              f"({'per-frame (independent)' if PER_FRAME else 'tracking' if TRACKING else 'warm-start'} mode)")
+
         obj_idxl = None
+        all_rows = []
         for index, color_image in enumerate(tqdm(color_images)):
             cur_cnt = index
             data_prefix = color_image.replace('color.png', '')
+            frame_stem = os.path.basename(data_prefix).rstrip('_')
             data = InferDataset.alternetive_init(data_prefix, img_size=GenPose2.cfg.img_size, device=GenPose2.cfg.device, n_pts=GenPose2.cfg.num_points)
-            
+
             obj_idxx = data.get_objects(only_idx=True)['idx']
             if obj_idxx.shape[0]:
                 if (PREV_POSE and ((obj_idxx.shape != obj_idxl.shape) or (obj_idxx!=obj_idxl).any())):
                     PREV_POSE = None
                 obj_idxl = obj_idxx
 
-                pose, length = GenPose2.inference(data, PREV_POSE, PREV_POSE and TRACKING, TRACKING_T0)
+                pose, length, scores = GenPose2.inference(
+                    data, PREV_POSE, PREV_POSE and TRACKING, TRACKING_T0, return_scores=True)
+                all_rows.extend(pose_rows(index, frame_stem, obj_idxx, pose, length, scores))
 
                 yellow = np.full_like(data.color, (255, 255, 0), dtype=np.uint8)
                 mask = (data.mask > 0).astype(np.uint8)
@@ -428,7 +496,7 @@ def main():
                 overlay = cv2.addWeighted(data.color, 1.0, yellow, alpha, 0, dtype=cv2.CV_8U)
                 data.color = np.where(mask_3c, overlay, data.color)
                 color_image_w_pose = visualize_pose(data, pose, length, visualize_image=False)
-                PREV_POSE = pose
+                PREV_POSE = None if PER_FRAME else pose
             else:
                 color_image_w_pose = data.color
                 PREV_POSE = None
@@ -442,6 +510,9 @@ def main():
             if key == ord('c'):               # press 'c' to stop tracking
                 break
             # 's' (reselect mask) is camera-only; no streamer exists offline.
+
+        if SAVE_POSES:
+            write_pose_csv(os.path.join(results_path, 'poses.csv'), all_rows)
 
     # img names "infer_{index:04d}.png" and only use 0~{cur_cnt}
     img_paths = sorted(glob.glob(os.path.join(save_res_img_path, '*.png')))

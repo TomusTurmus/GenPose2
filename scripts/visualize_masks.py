@@ -21,11 +21,15 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames_dir", default=DEFAULT_FRAMES)
     ap.add_argument("--montage", action="store_true", help="also write a combined grid")
-    ap.add_argument("--out", default=os.path.join(DEFAULT_FRAMES, "_mask_overlay.png"),
-                    help="montage path (only with --montage)")
+    ap.add_argument("--out", default=None,
+                    help="montage path (only with --montage); default: <frames_dir>/_mask_overlay.png")
     ap.add_argument("--cols", type=int, default=6)
     ap.add_argument("--alpha", type=float, default=0.45, help="mask tint opacity")
-    return ap.parse_args()
+    args = ap.parse_args()
+    # Derive from frames_dir so a non-default clip's montage doesn't land in clip 0001.
+    if args.out is None:
+        args.out = os.path.join(args.frames_dir, "_mask_overlay.png")
+    return args
 
 
 # distinct tint colors per mask id (id 1, 2, 3, ...)
